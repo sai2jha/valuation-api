@@ -1,12 +1,26 @@
 from flask import Flask, jsonify
 from flask_cors import CORS
-import yfinance as yf
 import requests
 import traceback
-from datetime import datetime, timedelta
+import os
+from datetime import datetime
 
 app = Flask(__name__)
 CORS(app)
+
+# Set ALPHAVANTAGE_KEY in Render environment variables for full valuation data
+# Get free key at: https://www.alphavantage.co/support/#api-key
+AV_KEY = os.environ.get('ALPHAVANTAGE_KEY', '')
+
+HEADERS = {
+    'User-Agent': (
+        'Mozilla/5.0 (Windows NT 10.0; Win64; x64) '
+        'AppleWebKit/537.36 (KHTML, like Gecko) '
+        'Chrome/124.0.0.0 Safari/537.36'
+    ),
+    'Accept': 'application/json, text/plain, */*',
+    'Referer': 'https://finance.yahoo.com/',
+}
 
 
 def safe_float(val):
@@ -17,46 +31,75 @@ def safe_float(val):
         return None
 
 
-def yf_chart_fallback(sym, period='1d'):
-    """Direct Yahoo Finance v8 chart as fallback (works without auth)."""
+def yf_chart(sym, period='1d'):
+    """Yahoo Finance v8 chart - works without authentication."""
+    url = (
+        f'https://query1.finance.yahoo.com/v8/finance/chart/{sym}'
+        f'?interval=1d&range={period}'
+    )
+    r = requests.get(url, headers=HEADERS, timeout=20)
+    r.raise_for_status()
+    return r.json()
+
+
+def parse_chart_history(data):
+    result = data.get('chart', {}).get('result', [None])[0]
+    if not result:
+        return []
+    ts = result.get('timestamp', [])
+    quotes = result.get('indicators', {}).get('quote', [{}])[0]
+    closes = quotes.get('close', [])
+    volumes = quotes.get('volume', [])
+    chart = []
+    for i, t in enumerate(ts):
+        c = closes[i] if i < len(closes) else None
+        v = volumes[i] if i < len(volumes) else 0
+        if c is not None:
+            chart.append({
+                'date': datetime.utcfromtimestamp(t).strftime('%Y-%m-%d'),
+                'close': round(float(c), 2),
+                'volume': int(v or 0),
+            })
+    return chart
+
+
+def av_overview(sym):
+    """Alpha Vantage Company Overview - has PE, PB, EPS, sector, etc."""
+    if not AV_KEY:
+        return {}
     try:
-        headers = {
-            'User-Agent': (
-                'Mozilla/5.0 (Windows NT 10.0; Win64; x64) '
-                'AppleWebKit/537.36 (KHTML, like Gecko) '
-                'Chrome/124.0.0.0 Safari/537.36'
-            ),
-            'Accept': 'application/json, text/plain, */*',
-            'Referer': 'https://finance.yahoo.com/',
-        }
         url = (
-            f'https://query1.finance.yahoo.com/v8/finance/chart/{sym}'
-            f'?interval=1d&range={period}'
+            f'https://www.alphavantage.co/query'
+            f'?function=OVERVIEW&symbol={sym}&apikey={AV_KEY}'
         )
-        r = requests.get(url, headers=headers, timeout=20)
-        r.raise_for_status()
-        data = r.json()
-        result = data.get('chart', {}).get('result', [None])[0]
-        if not result:
-            return None, []
-        meta = result.get('meta', {})
-        ts = result.get('timestamp', [])
-        quotes = result.get('indicators', {}).get('quote', [{}])[0]
-        closes = quotes.get('close', [])
-        volumes = quotes.get('volume', [])
-        chart = []
-        for i, t in enumerate(ts):
-            c = closes[i] if i < len(closes) else None
-            v = volumes[i] if i < len(volumes) else 0
-            if c is not None:
-                chart.append({
-                    'date': datetime.utcfromtimestamp(t).strftime('%Y-%m-%d'),
-                    'close': round(float(c), 2),
-                    'volume': int(v or 0),
-                })
-        return meta, chart
+        r = requests.get(url, timeout=15)
+        if r.status_code == 200:
+            data = r.json()
+            if data and 'Symbol' in data:
+                return data
     except Exception:
-        return None, []
+        pass
+    return {}
+
+
+def av_quote(sym):
+    """Alpha Vantage Global Quote - current price, change, volume."""
+    if not AV_KEY:
+        return {}
+    try:
+        url = (
+            f'https://www.alphavantage.co/query'
+            f'?function=GLOBAL_QUOTE&symbol={sym}&apikey={AV_KEY}'
+        )
+        r = requests.get(url, timeout=15)
+        if r.status_code == 200:
+            data = r.json()
+            q = data.get('Global Quote', {})
+            if q and q.get('05. price'):
+                return q
+    except Exception:
+        pass
+    return {}
 
 
 @app.route('/api/stock/<ticker>')
@@ -64,133 +107,98 @@ def get_stock(ticker):
     try:
         sym = ticker.upper()
 
-        # Try yfinance first (handles auth internally)
+        # 1. Get price from Yahoo Finance v8 (always works)
         try:
-            ticker_obj = yf.Ticker(sym)
-            info = ticker_obj.info
+            price_data = yf_chart(sym, '1d')
+        except Exception as e:
+            return jsonify({'error': f'No data for "{sym}": {str(e)}'}), 404
 
-            price = safe_float(info.get('currentPrice') or info.get('regularMarketPrice'))
-            if not price:
-                raise ValueError('No price from yfinance')
+        pr_result = price_data.get('chart', {}).get('result', [None])[0]
+        if not pr_result:
+            return jsonify({'error': f'No data found for "{sym}".'}), 404
 
-            # Get history for chart
-            hist = ticker_obj.history(period='1y')
-            chart = []
-            for idx, row in hist.iterrows():
-                chart.append({
-                    'date': idx.strftime('%Y-%m-%d'),
-                    'close': round(float(row['Close']), 2),
-                    'volume': int(row['Volume']),
-                })
+        meta = pr_result.get('meta', {})
+        price = safe_float(meta.get('regularMarketPrice'))
+        if not price:
+            return jsonify({'error': f'No price for "{sym}".'}), 404
 
-            # Analyst recommendations
-            recs = []
-            try:
-                rec_df = ticker_obj.recommendations
-                if rec_df is not None and not rec_df.empty:
-                    # Get last few periods
-                    for _, row in rec_df.tail(4).iterrows():
-                        recs.append({
-                            'period': str(row.get('period', '')),
-                            'strongBuy': int(row.get('strongBuy', 0)),
-                            'buy': int(row.get('buy', 0)),
-                            'hold': int(row.get('hold', 0)),
-                            'sell': int(row.get('sell', 0)),
-                            'strongSell': int(row.get('strongSell', 0)),
-                        })
-            except Exception:
-                pass
+        prev_close = safe_float(
+            meta.get('chartPreviousClose') or meta.get('previousClose')
+        )
 
-            prev_close = safe_float(info.get('previousClose'))
-            chg = safe_float(info.get('regularMarketChange'))
-            if not chg and price and prev_close:
-                chg = round(price - prev_close, 4)
-            chg_pct_raw = safe_float(info.get('regularMarketChangePercent'))
-            if chg_pct_raw:
-                chg_pct = round(chg_pct_raw / 100, 6)
-            elif chg and prev_close:
-                chg_pct = round(chg / prev_close, 6)
-            else:
-                chg_pct = None
+        # 2. Get full chart history
+        chart = []
+        try:
+            hist_data = yf_chart(sym, '1y')
+            chart = parse_chart_history(hist_data)
+        except Exception:
+            pass
 
-            result = {
-                'symbol': sym,
-                'companyName': info.get('longName') or info.get('shortName') or sym,
-                'sector': info.get('sector', ''),
-                'industry': info.get('industry', ''),
-                'price': price,
-                'previousClose': prev_close,
-                'change': chg,
-                'changePercent': chg_pct,
-                'marketCap': safe_float(info.get('marketCap')),
-                'volume': info.get('volume') or info.get('regularMarketVolume'),
-                'avgVolume': safe_float(info.get('averageVolume')),
-                'fiftyTwoWeekHigh': safe_float(info.get('fiftyTwoWeekHigh')),
-                'fiftyTwoWeekLow': safe_float(info.get('fiftyTwoWeekLow')),
-                'peRatio': safe_float(info.get('trailingPE')),
-                'forwardPE': safe_float(info.get('forwardPE')),
-                'pbRatio': safe_float(info.get('priceToBook')),
-                'psRatio': safe_float(info.get('priceToSalesTrailing12Months')),
-                'evEbitda': safe_float(info.get('enterpriseToEbitda')),
-                'debtEquity': safe_float(info.get('debtToEquity')),
-                'currentRatio': safe_float(info.get('currentRatio')),
-                'roe': safe_float(info.get('returnOnEquity')),
-                'revenueGrowth': safe_float(info.get('revenueGrowth')),
-                'earningsGrowth': safe_float(info.get('earningsGrowth')),
-                'grossMargin': safe_float(info.get('grossMargins')),
-                'operatingMargin': safe_float(info.get('operatingMargins')),
-                'dividendYield': safe_float(info.get('dividendYield')),
-                'beta': safe_float(info.get('beta')),
-                'eps': safe_float(info.get('trailingEps')),
-                'targetPrice': safe_float(info.get('targetMeanPrice')),
-                'chart': chart,
-                'analystRecommendations': recs,
-            }
-            return jsonify(result)
+        # 3. Get valuation data from Alpha Vantage (needs API key)
+        overview = av_overview(sym)
+        aq = av_quote(sym)
 
-        except Exception as yf_err:
-            # Fallback: use v8 chart for basic price + chart data
-            meta, chart = yf_chart_fallback(sym, '1y')
-            if not meta:
-                return jsonify(
-                    {'error': f'No data for "{sym}". Check the ticker.'}
-                ), 404
-            price = safe_float(meta.get('regularMarketPrice'))
-            if not price:
-                return jsonify(
-                    {'error': f'No price data for "{sym}".'}
-                ), 404
-            prev_close = safe_float(
-                meta.get('chartPreviousClose') or meta.get('previousClose')
-            )
-            chg = round(price - prev_close, 4) if price and prev_close else None
-            chg_pct = (
-                round(chg / prev_close, 6) if chg and prev_close else None
-            )
-            return jsonify({
-                'symbol': sym,
-                'companyName': sym,
-                'sector': '',
-                'industry': '',
-                'price': price,
-                'previousClose': prev_close,
-                'change': chg,
-                'changePercent': chg_pct,
-                'marketCap': None,
-                'volume': meta.get('regularMarketVolume'),
-                'avgVolume': None,
-                'fiftyTwoWeekHigh': safe_float(meta.get('fiftyTwoWeekHigh')),
-                'fiftyTwoWeekLow': safe_float(meta.get('fiftyTwoWeekLow')),
-                'peRatio': None, 'forwardPE': None, 'pbRatio': None,
-                'psRatio': None, 'evEbitda': None, 'debtEquity': None,
-                'currentRatio': None, 'roe': None, 'revenueGrowth': None,
-                'earningsGrowth': None, 'grossMargin': None,
-                'operatingMargin': None, 'dividendYield': None,
-                'beta': None, 'eps': None, 'targetPrice': None,
-                'chart': chart,
-                'analystRecommendations': [],
-                '_note': f'yfinance failed: {str(yf_err)[:100]}',
-            })
+        # Use AV price if available, else Yahoo v8 price
+        if aq.get('05. price'):
+            price = safe_float(aq.get('05. price')) or price
+            prev_close = safe_float(aq.get('08. previous close')) or prev_close
+
+        chg = safe_float(aq.get('09. change'))
+        if not chg and price and prev_close:
+            chg = round(price - prev_close, 4)
+        chg_pct_raw = safe_float(aq.get('10. change percent', '').replace('%', ''))
+        if chg_pct_raw is not None:
+            chg_pct = round(chg_pct_raw / 100, 6)
+        elif chg and prev_close:
+            chg_pct = round(chg / prev_close, 6)
+        else:
+            chg_pct = None
+
+        # Extract valuation fields from Alpha Vantage overview
+        def ov(key):
+            v = overview.get(key, 'None')
+            return safe_float(v) if v not in ('None', '', '-') else None
+
+        result = {
+            'symbol': sym,
+            'companyName': overview.get('Name') or sym,
+            'sector': overview.get('Sector', ''),
+            'industry': overview.get('Industry', ''),
+            'price': price,
+            'previousClose': prev_close,
+            'change': chg,
+            'changePercent': chg_pct,
+            'marketCap': ov('MarketCapitalization'),
+            'volume': meta.get('regularMarketVolume'),
+            'avgVolume': ov('200DayMovingAverage'),
+            'fiftyTwoWeekHigh': safe_float(
+                overview.get('52WeekHigh') or meta.get('fiftyTwoWeekHigh')
+            ),
+            'fiftyTwoWeekLow': safe_float(
+                overview.get('52WeekLow') or meta.get('fiftyTwoWeekLow')
+            ),
+            'peRatio': ov('PERatio'),
+            'forwardPE': ov('ForwardPE'),
+            'pbRatio': ov('PriceToBookRatio'),
+            'psRatio': ov('PriceToSalesRatioTTM'),
+            'evEbitda': ov('EVToEBITDA'),
+            'debtEquity': None,
+            'currentRatio': None,
+            'roe': ov('ReturnOnEquityTTM'),
+            'revenueGrowth': ov('QuarterlyRevenueGrowthYOY'),
+            'earningsGrowth': ov('QuarterlyEarningsGrowthYOY'),
+            'grossMargin': ov('GrossProfitTTM'),
+            'operatingMargin': ov('OperatingMarginTTM'),
+            'dividendYield': ov('DividendYield'),
+            'beta': ov('Beta'),
+            'eps': ov('EPS'),
+            'targetPrice': ov('AnalystTargetPrice'),
+            'chart': chart,
+            'analystRecommendations': [],
+            '_source': 'alphavantage' if overview.get('Symbol') else 'yahoo_v8_only',
+        }
+
+        return jsonify(result)
 
     except Exception as e:
         tb = traceback.format_exc()
