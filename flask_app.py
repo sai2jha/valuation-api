@@ -3,7 +3,6 @@ from flask_cors import CORS
 import requests
 import traceback
 import json
-import re
 from datetime import datetime
 
 app = Flask(__name__)
@@ -13,8 +12,15 @@ HEADERS = {
     'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
     'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
     'Accept-Language': 'en-US,en;q=0.5',
-    'Accept-Encoding': 'gzip, deflate',
+    'Accept-Encoding': 'gzip, deflate, br',
     'Connection': 'keep-alive',
+}
+
+JSON_HEADERS = {
+    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+    'Accept': 'application/json, text/plain, */*',
+    'Accept-Language': 'en-US,en;q=0.9',
+    'Referer': 'https://finance.yahoo.com/',
 }
 
 
@@ -26,91 +32,21 @@ def safe_float(val):
         return None
 
 
-def parse_raw(val):
-    if isinstance(val, dict):
-        return safe_float(val.get('raw'))
-    return safe_float(val)
+def g(d, *keys):
+    for k in keys:
+        if not isinstance(d, dict):
+            return None
+        d = d.get(k)
+        if isinstance(d, dict) and 'raw' in d:
+            return d['raw']
+    return d
 
 
-def fetch_chart_data(sym, session, period='1d'):
-    url = (
-        f'https://query1.finance.yahoo.com/v8/finance/chart/{sym}'
-        f'?interval=1d&range={period}'
-    )
-    r = session.get(url, timeout=20)
+def yf_chart(sym, session, period='1d'):
+    url = f'https://query1.finance.yahoo.com/v8/finance/chart/{sym}?interval=1d&range={period}'
+    r = session.get(url, headers=JSON_HEADERS, timeout=20)
     r.raise_for_status()
     return r.json()
-
-
-def fetch_yahoo_html(sym, session):
-    url = f'https://finance.yahoo.com/quote/{sym}/'
-    r = session.get(url, headers=HEADERS, timeout=20)
-    # May get redirected to consent page - handle gracefully
-    if r.status_code != 200:
-        return None
-    return r.text
-
-
-def extract_store_data(html):
-    if not html:
-        return {}
-    # Yahoo Finance embeds data in window.YAHOO_FINANCE_DATA or similar
-    patterns = [
-        r'root\.App\.main\s*=\s*({.+?});\s*(?:\(function|</script>)',
-        r'"QuoteSummaryStore":\s*({.+?}),\s*"QuoteHeaderInfoStore"',
-        r'context\.dispatcher\.stores\s*=\s*({.+?});',
-    ]
-    for pat in patterns:
-        m = re.search(pat, html, re.DOTALL)
-        if m:
-            try:
-                data = json.loads(m.group(1))
-                return data
-            except Exception:
-                pass
-    return {}
-
-
-def fetch_fmp_quote(sym):
-    """FMP free tier - 250 req/day, no key needed for basic quote."""
-    try:
-        url = f'https://financialmodelingprep.com/api/v3/quote/{sym}?apikey=demo'
-        r = requests.get(url, timeout=10)
-        if r.status_code == 200:
-            data = r.json()
-            if data and isinstance(data, list):
-                return data[0]
-    except Exception:
-        pass
-    return {}
-
-
-def fetch_fmp_ratios(sym):
-    """FMP TTM ratios."""
-    try:
-        url = f'https://financialmodelingprep.com/api/v3/ratios-ttm/{sym}?apikey=demo'
-        r = requests.get(url, timeout=10)
-        if r.status_code == 200:
-            data = r.json()
-            if data and isinstance(data, list):
-                return data[0]
-    except Exception:
-        pass
-    return {}
-
-
-def fetch_fmp_profile(sym):
-    """FMP company profile."""
-    try:
-        url = f'https://financialmodelingprep.com/api/v3/profile/{sym}?apikey=demo'
-        r = requests.get(url, timeout=10)
-        if r.status_code == 200:
-            data = r.json()
-            if data and isinstance(data, list):
-                return data[0]
-    except Exception:
-        pass
-    return {}
 
 
 def parse_chart_history(data):
@@ -134,27 +70,71 @@ def parse_chart_history(data):
     return chart
 
 
+def yf_summary_via_html(sym, session):
+    """Extract financial data from Yahoo Finance HTML page's embedded JSON."""
+    url = f'https://finance.yahoo.com/quote/{sym}/'
+    try:
+        r = session.get(url, headers=HEADERS, timeout=20, allow_redirects=True)
+        if r.status_code != 200:
+            return {}
+        html = r.text
+        # Look for the embedded JSON data in the page
+        # Yahoo Finance puts data in a script tag as JSON
+        import re
+        patterns = [
+            r'"QuoteSummaryStore":\s*({[^<]+}),\s*"[A-Z]',
+            r'root\.App\.main\s*=\s*({.+?});\s*}\(this\)',
+            r'"context":\s*{[^}]*"dispatcher":\s*{"stores":\s*({.+?}),"actions"',
+        ]
+        for pat in patterns:
+            m = re.search(pat, html, re.DOTALL)
+            if m:
+                try:
+                    data = json.loads(m.group(1))
+                    return data
+                except Exception:
+                    pass
+    except Exception:
+        pass
+    return {}
+
+
+def try_quotesummary_no_crumb(sym, session):
+    """Try Yahoo Finance v10 quoteSummary via query2 host (sometimes works)."""
+    modules = (
+        'summaryDetail,financialData,defaultKeyStatistics,'
+        'assetProfile,recommendationTrend,price'
+    )
+    for host in ['query2', 'query1']:
+        url = (
+            f'https://{host}.finance.yahoo.com/v10/finance/quoteSummary/{sym}'
+            f'?modules={modules}&formatted=false&lang=en-US&region=US'
+        )
+        try:
+            r = session.get(url, headers=JSON_HEADERS, timeout=15)
+            if r.status_code == 200:
+                data = r.json()
+                result = data.get('quoteSummary', {}).get('result', [None])
+                if result and result[0]:
+                    return result[0], None
+        except Exception as e:
+            continue
+    return {}, '401 on both hosts'
+
+
 @app.route('/api/stock/<ticker>')
 def get_stock(ticker):
     try:
         sym = ticker.upper()
-
         session = requests.Session()
-        session.headers.update({
-            'User-Agent': (
-                'Mozilla/5.0 (Windows NT 10.0; Win64; x64) '
-                'AppleWebKit/537.36 (KHTML, like Gecko) '
-                'Chrome/124.0.0.0 Safari/537.36'
-            )
-        })
 
-        # 1. Get price data from Yahoo Finance v8 chart (reliable, no auth)
+        # 1. Basic price from v8 chart (reliable)
         try:
-            price_raw = fetch_chart_data(sym, session, '1d')
+            price_data = yf_chart(sym, session, '1d')
         except Exception as e:
             return jsonify({'error': f'No data for "{sym}": {str(e)}'}), 404
 
-        pr_result = price_raw.get('chart', {}).get('result', [None])[0]
+        pr_result = price_data.get('chart', {}).get('result', [None])[0]
         if not pr_result:
             return jsonify({'error': f'No data for "{sym}".'}), 404
 
@@ -169,58 +149,85 @@ def get_stock(ticker):
         chg = round(price - prev_close, 4) if price and prev_close else None
         chg_pct = round(chg / prev_close, 6) if chg and prev_close else None
 
-        # 2. Get valuation ratios from FMP (free tier)
-        fmp_q = fetch_fmp_quote(sym)
-        fmp_r = fetch_fmp_ratios(sym)
-        fmp_p = fetch_fmp_profile(sym)
+        # 2. Try v10 quoteSummary (may work depending on Render IP)
+        summary, v10_err = try_quotesummary_no_crumb(sym, session)
+        sd = summary.get('summaryDetail', {})
+        fd = summary.get('financialData', {})
+        ks = summary.get('defaultKeyStatistics', {})
+        ap = summary.get('assetProfile', {})
+        pr = summary.get('price', {})
+        rt = summary.get('recommendationTrend', {})
 
-        # 3. Get 1-year chart history
+        # Update price fields if v10 has better data
+        if g(sd, 'previousClose'):
+            prev_close = safe_float(g(sd, 'previousClose'))
+            chg = round(price - prev_close, 4) if price and prev_close else chg
+            chg_pct = (
+                round(chg / prev_close, 6) if chg and prev_close else chg_pct
+            )
+
+        mkt_cap = g(pr, 'marketCap') or g(sd, 'marketCap')
+
+        recs = []
+        for row in rt.get('trend', []):
+            recs.append({
+                'period': row.get('period', ''),
+                'strongBuy': row.get('strongBuy', 0),
+                'buy': row.get('buy', 0),
+                'hold': row.get('hold', 0),
+                'sell': row.get('sell', 0),
+                'strongSell': row.get('strongSell', 0),
+            })
+
+        # 3. Chart history
         chart = []
         try:
-            hist_raw = fetch_chart_data(sym, session, '1y')
-            chart = parse_chart_history(hist_raw)
+            hist_data = yf_chart(sym, session, '1y')
+            chart = parse_chart_history(hist_data)
         except Exception:
             pass
 
         result = {
             'symbol': sym,
-            'companyName': fmp_p.get('companyName') or fmp_q.get('name') or sym,
-            'sector': fmp_p.get('sector', ''),
-            'industry': fmp_p.get('industry', ''),
+            'companyName': (
+                g(pr, 'longName') or g(pr, 'shortName') or sym
+            ),
+            'sector': ap.get('sector', ''),
+            'industry': ap.get('industry', ''),
             'price': price,
-            'previousClose': prev_close or safe_float(fmp_q.get('previousClose')),
-            'change': chg or safe_float(fmp_q.get('change')),
+            'previousClose': prev_close,
+            'change': chg,
             'changePercent': chg_pct,
-            'marketCap': safe_float(fmp_q.get('marketCap') or fmp_p.get('mktCap')),
-            'volume': meta.get('regularMarketVolume') or fmp_q.get('volume'),
-            'avgVolume': safe_float(fmp_q.get('avgVolume')),
+            'marketCap': safe_float(mkt_cap),
+            'volume': (
+                g(pr, 'regularMarketVolume') or meta.get('regularMarketVolume')
+            ),
+            'avgVolume': safe_float(g(sd, 'averageVolume')),
             'fiftyTwoWeekHigh': safe_float(
-                meta.get('fiftyTwoWeekHigh') or fmp_q.get('yearHigh')
+                g(sd, 'fiftyTwoWeekHigh') or meta.get('fiftyTwoWeekHigh')
             ),
             'fiftyTwoWeekLow': safe_float(
-                meta.get('fiftyTwoWeekLow') or fmp_q.get('yearLow')
+                g(sd, 'fiftyTwoWeekLow') or meta.get('fiftyTwoWeekLow')
             ),
-            # Valuation ratios from FMP
-            'peRatio': safe_float(fmp_q.get('pe') or fmp_r.get('peRatioTTM')),
-            'forwardPE': safe_float(fmp_r.get('priceEarningsToGrowthRatioTTM')),
-            'pbRatio': safe_float(fmp_r.get('priceToBookRatioTTM')),
-            'psRatio': safe_float(fmp_r.get('priceToSalesRatioTTM')),
-            'evEbitda': safe_float(fmp_r.get('enterpriseValueMultipleTTM')),
-            'debtEquity': safe_float(fmp_r.get('debtEquityRatioTTM')),
-            'currentRatio': safe_float(fmp_r.get('currentRatioTTM')),
-            'roe': safe_float(fmp_r.get('returnOnEquityTTM')),
-            'revenueGrowth': safe_float(fmp_r.get('revenueGrowthTTM')),
-            'earningsGrowth': safe_float(fmp_r.get('netIncomeGrowthTTM')),
-            'grossMargin': safe_float(fmp_r.get('grossProfitMarginTTM')),
-            'operatingMargin': safe_float(fmp_r.get('operatingProfitMarginTTM')),
-            'dividendYield': safe_float(
-                fmp_q.get('dividendYield') or fmp_r.get('dividendYieldTTM')
-            ),
-            'beta': safe_float(fmp_p.get('beta') or fmp_q.get('priceAvg200')),
-            'eps': safe_float(fmp_q.get('eps')),
-            'targetPrice': safe_float(fmp_q.get('priceAvg200')),
+            'peRatio': safe_float(g(sd, 'trailingPE')),
+            'forwardPE': safe_float(g(sd, 'forwardPE')),
+            'pbRatio': safe_float(g(ks, 'priceToBook')),
+            'psRatio': safe_float(g(sd, 'priceToSalesTrailing12Months')),
+            'evEbitda': safe_float(g(ks, 'enterpriseToEbitda')),
+            'debtEquity': safe_float(g(fd, 'debtToEquity')),
+            'currentRatio': safe_float(g(fd, 'currentRatio')),
+            'roe': safe_float(g(fd, 'returnOnEquity')),
+            'revenueGrowth': safe_float(g(fd, 'revenueGrowth')),
+            'earningsGrowth': safe_float(g(fd, 'earningsGrowth')),
+            'grossMargin': safe_float(g(fd, 'grossMargins')),
+            'operatingMargin': safe_float(g(fd, 'operatingMargins')),
+            'dividendYield': safe_float(g(sd, 'dividendYield')),
+            'beta': safe_float(g(sd, 'beta')),
+            'eps': safe_float(g(ks, 'trailingEps')),
+            'targetPrice': safe_float(g(fd, 'targetMeanPrice')),
             'chart': chart,
-            'analystRecommendations': [],
+            'analystRecommendations': recs,
+            '_v10': v10_err,
         }
 
         return jsonify(result)
