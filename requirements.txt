@@ -1,4 +1,4 @@
 flask
 flask-cors
-yfinance
+requests
 gunicorn
