@@ -8,21 +8,6 @@ from datetime import datetime
 app = Flask(__name__)
 CORS(app)
 
-HEADERS = {
-    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
-    'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-    'Accept-Language': 'en-US,en;q=0.5',
-    'Accept-Encoding': 'gzip, deflate, br',
-    'Connection': 'keep-alive',
-}
-
-JSON_HEADERS = {
-    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
-    'Accept': 'application/json, text/plain, */*',
-    'Accept-Language': 'en-US,en;q=0.9',
-    'Referer': 'https://finance.yahoo.com/',
-}
-
 
 def safe_float(val):
     try:
@@ -42,11 +27,118 @@ def g(d, *keys):
     return d
 
 
-def yf_chart(sym, session, period='1d'):
+def get_session():
+    """Create authenticated session with Yahoo Finance cookies and crumb."""
+    session = requests.Session()
+    ua = (
+        'Mozilla/5.0 (Windows NT 10.0; Win64; x64) '
+        'AppleWebKit/537.36 (KHTML, like Gecko) '
+        'Chrome/124.0.0.0 Safari/537.36'
+    )
+    session.headers.update({'User-Agent': ua})
+    crumb = None
+
+    # Step 1: Visit fc.yahoo.com to get initial A3 cookie
+    try:
+        session.get(
+            'https://fc.yahoo.com',
+            headers={
+                'User-Agent': ua,
+                'Accept': 'text/html,*/*;q=0.8',
+            },
+            timeout=8
+        )
+    except Exception:
+        pass
+
+    # Step 2: Try the non-JS cookie endpoint
+    for url in [
+        'https://finance.yahoo.com/?guccounter=1',
+        'https://finance.yahoo.com/quote/AAPL/',
+        'https://finance.yahoo.com/',
+    ]:
+        try:
+            r = session.get(
+                url,
+                headers={
+                    'User-Agent': ua,
+                    'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+                    'Accept-Language': 'en-US,en;q=0.5',
+                    'Accept-Encoding': 'gzip, deflate, br',
+                    'Connection': 'keep-alive',
+                },
+                timeout=15,
+                allow_redirects=True
+            )
+            if r.status_code == 200 and 'finance.yahoo' in r.url:
+                break
+        except Exception:
+            continue
+
+    # Step 3: Get crumb
+    for crumb_url in [
+        'https://query1.finance.yahoo.com/v1/test/getcrumb',
+        'https://query2.finance.yahoo.com/v1/test/getcrumb',
+    ]:
+        try:
+            r = session.get(
+                crumb_url,
+                headers={
+                    'User-Agent': ua,
+                    'Accept': 'application/json, text/plain, */*',
+                    'Referer': 'https://finance.yahoo.com/',
+                },
+                timeout=10
+            )
+            if r.status_code == 200 and r.text and r.text.strip() not in ('null', ''):
+                crumb = r.text.strip().strip('"')
+                break
+        except Exception:
+            pass
+
+    return session, crumb
+
+
+def yf_chart(sym, session, crumb, period='1d'):
     url = f'https://query1.finance.yahoo.com/v8/finance/chart/{sym}?interval=1d&range={period}'
-    r = session.get(url, headers=JSON_HEADERS, timeout=20)
+    if crumb:
+        url += f'&crumb={crumb}'
+    headers = {
+        'Accept': 'application/json, text/plain, */*',
+        'Referer': 'https://finance.yahoo.com/',
+    }
+    r = session.get(url, headers=headers, timeout=20)
     r.raise_for_status()
     return r.json()
+
+
+def yf_summary(sym, session, crumb):
+    if not crumb:
+        return {}, 'no crumb'
+    modules = (
+        'summaryDetail,financialData,defaultKeyStatistics,'
+        'assetProfile,recommendationTrend,price'
+    )
+    headers = {
+        'Accept': 'application/json, text/plain, */*',
+        'Referer': 'https://finance.yahoo.com/',
+    }
+    for host in ['query1', 'query2']:
+        url = (
+            f'https://{host}.finance.yahoo.com/v10/finance/quoteSummary/{sym}'
+            f'?modules={modules}&crumb={crumb}&formatted=false'
+        )
+        try:
+            r = session.get(url, headers=headers, timeout=20)
+            if r.status_code == 200:
+                result = r.json().get('quoteSummary', {}).get('result', [None])
+                if result and result[0]:
+                    return result[0], None
+            elif r.status_code == 401:
+                continue
+        except Exception as e:
+            continue
+    return {}, f'401 both hosts (crumb: {bool(crumb)})'
 
 
 def parse_chart_history(data):
@@ -70,67 +162,16 @@ def parse_chart_history(data):
     return chart
 
 
-def yf_summary_via_html(sym, session):
-    """Extract financial data from Yahoo Finance HTML page's embedded JSON."""
-    url = f'https://finance.yahoo.com/quote/{sym}/'
-    try:
-        r = session.get(url, headers=HEADERS, timeout=20, allow_redirects=True)
-        if r.status_code != 200:
-            return {}
-        html = r.text
-        # Look for the embedded JSON data in the page
-        # Yahoo Finance puts data in a script tag as JSON
-        import re
-        patterns = [
-            r'"QuoteSummaryStore":\s*({[^<]+}),\s*"[A-Z]',
-            r'root\.App\.main\s*=\s*({.+?});\s*}\(this\)',
-            r'"context":\s*{[^}]*"dispatcher":\s*{"stores":\s*({.+?}),"actions"',
-        ]
-        for pat in patterns:
-            m = re.search(pat, html, re.DOTALL)
-            if m:
-                try:
-                    data = json.loads(m.group(1))
-                    return data
-                except Exception:
-                    pass
-    except Exception:
-        pass
-    return {}
-
-
-def try_quotesummary_no_crumb(sym, session):
-    """Try Yahoo Finance v10 quoteSummary via query2 host (sometimes works)."""
-    modules = (
-        'summaryDetail,financialData,defaultKeyStatistics,'
-        'assetProfile,recommendationTrend,price'
-    )
-    for host in ['query2', 'query1']:
-        url = (
-            f'https://{host}.finance.yahoo.com/v10/finance/quoteSummary/{sym}'
-            f'?modules={modules}&formatted=false&lang=en-US&region=US'
-        )
-        try:
-            r = session.get(url, headers=JSON_HEADERS, timeout=15)
-            if r.status_code == 200:
-                data = r.json()
-                result = data.get('quoteSummary', {}).get('result', [None])
-                if result and result[0]:
-                    return result[0], None
-        except Exception as e:
-            continue
-    return {}, '401 on both hosts'
-
-
 @app.route('/api/stock/<ticker>')
 def get_stock(ticker):
     try:
         sym = ticker.upper()
-        session = requests.Session()
 
-        # 1. Basic price from v8 chart (reliable)
+        session, crumb = get_session()
+
+        # 1. Basic price from v8 chart (works without crumb)
         try:
-            price_data = yf_chart(sym, session, '1d')
+            price_data = yf_chart(sym, session, crumb, '1d')
         except Exception as e:
             return jsonify({'error': f'No data for "{sym}": {str(e)}'}), 404
 
@@ -143,14 +184,12 @@ def get_stock(ticker):
         if not price:
             return jsonify({'error': f'No price for "{sym}".'}), 404
 
-        prev_close = safe_float(
+        prev_close_raw = safe_float(
             meta.get('chartPreviousClose') or meta.get('previousClose')
         )
-        chg = round(price - prev_close, 4) if price and prev_close else None
-        chg_pct = round(chg / prev_close, 6) if chg and prev_close else None
 
-        # 2. Try v10 quoteSummary (may work depending on Render IP)
-        summary, v10_err = try_quotesummary_no_crumb(sym, session)
+        # 2. Rich valuation data from v10 (requires crumb)
+        summary, v10_err = yf_summary(sym, session, crumb)
         sd = summary.get('summaryDetail', {})
         fd = summary.get('financialData', {})
         ks = summary.get('defaultKeyStatistics', {})
@@ -158,15 +197,10 @@ def get_stock(ticker):
         pr = summary.get('price', {})
         rt = summary.get('recommendationTrend', {})
 
-        # Update price fields if v10 has better data
-        if g(sd, 'previousClose'):
-            prev_close = safe_float(g(sd, 'previousClose'))
-            chg = round(price - prev_close, 4) if price and prev_close else chg
-            chg_pct = (
-                round(chg / prev_close, 6) if chg and prev_close else chg_pct
-            )
-
+        prev_close = safe_float(g(sd, 'previousClose')) or prev_close_raw
         mkt_cap = g(pr, 'marketCap') or g(sd, 'marketCap')
+        chg = round(price - prev_close, 4) if price and prev_close else None
+        chg_pct = round(chg / prev_close, 6) if chg and prev_close else None
 
         recs = []
         for row in rt.get('trend', []):
@@ -182,16 +216,14 @@ def get_stock(ticker):
         # 3. Chart history
         chart = []
         try:
-            hist_data = yf_chart(sym, session, '1y')
+            hist_data = yf_chart(sym, session, crumb, '1y')
             chart = parse_chart_history(hist_data)
         except Exception:
             pass
 
         result = {
             'symbol': sym,
-            'companyName': (
-                g(pr, 'longName') or g(pr, 'shortName') or sym
-            ),
+            'companyName': g(pr, 'longName') or g(pr, 'shortName') or sym,
             'sector': ap.get('sector', ''),
             'industry': ap.get('industry', ''),
             'price': price,
@@ -199,9 +231,7 @@ def get_stock(ticker):
             'change': chg,
             'changePercent': chg_pct,
             'marketCap': safe_float(mkt_cap),
-            'volume': (
-                g(pr, 'regularMarketVolume') or meta.get('regularMarketVolume')
-            ),
+            'volume': g(pr, 'regularMarketVolume') or meta.get('regularMarketVolume'),
             'avgVolume': safe_float(g(sd, 'averageVolume')),
             'fiftyTwoWeekHigh': safe_float(
                 g(sd, 'fiftyTwoWeekHigh') or meta.get('fiftyTwoWeekHigh')
@@ -227,7 +257,7 @@ def get_stock(ticker):
             'targetPrice': safe_float(g(fd, 'targetMeanPrice')),
             'chart': chart,
             'analystRecommendations': recs,
-            '_v10': v10_err,
+            '_debug': {'crumb': crumb, 'v10': v10_err},
         }
 
         return jsonify(result)
