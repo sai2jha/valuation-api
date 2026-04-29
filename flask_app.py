@@ -369,5 +369,34 @@ def get_stock(ticker):
         return jsonify({'error': str(e), 'trace': tb}), 500
 
 
+
+@app.route('/api/debug')
+def debug_info():
+    import traceback as tb2
+    key_present = bool(AV_KEY)
+    key_prefix = AV_KEY[:4] + '...' if AV_KEY else 'MISSING'
+    av_result = {}
+    av_error = None
+    try:
+        url = (
+            f'https://www.alphavantage.co/query'
+            f'?function=OVERVIEW&symbol=AAPL&apikey={AV_KEY}'
+        )
+        r = requests.get(url, timeout=15)
+        av_result = {
+            'status': r.status_code,
+            'has_symbol': 'Symbol' in r.json(),
+            'keys': list(r.json().keys())[:5],
+        }
+    except Exception as e:
+        av_error = str(e)
+    return jsonify({
+        'key_present': key_present,
+        'key_prefix': key_prefix,
+        'av_test': av_result,
+        'av_error': av_error,
+    })
+
+
 if __name__ == '__main__':
     app.run(debug=True)
