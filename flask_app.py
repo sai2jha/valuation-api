@@ -8,8 +8,6 @@ from datetime import datetime
 app = Flask(__name__)
 CORS(app)
 
-# Set ALPHAVANTAGE_KEY in Render environment variables for full valuation data
-# Get free key at: https://www.alphavantage.co/support/#api-key
 AV_KEY = os.environ.get('ALPHAVANTAGE_KEY', '')
 
 HEADERS = {
@@ -32,7 +30,6 @@ def safe_float(val):
 
 
 def yf_chart(sym, period='1d'):
-    """Yahoo Finance v8 chart - works without authentication."""
     url = (
         f'https://query1.finance.yahoo.com/v8/finance/chart/{sym}'
         f'?interval=1d&range={period}'
@@ -64,7 +61,6 @@ def parse_chart_history(data):
 
 
 def av_overview(sym):
-    """Alpha Vantage Company Overview - has PE, PB, EPS, sector, etc."""
     if not AV_KEY:
         return {}
     try:
@@ -83,7 +79,6 @@ def av_overview(sym):
 
 
 def av_quote(sym):
-    """Alpha Vantage Global Quote - current price, change, volume."""
     if not AV_KEY:
         return {}
     try:
@@ -102,12 +97,141 @@ def av_quote(sym):
     return {}
 
 
+def av_income_statement(sym):
+    if not AV_KEY:
+        return []
+    try:
+        url = (
+            f'https://www.alphavantage.co/query'
+            f'?function=INCOME_STATEMENT&symbol={sym}&apikey={AV_KEY}'
+        )
+        r = requests.get(url, timeout=15)
+        if r.status_code == 200:
+            data = r.json()
+            reports = data.get('annualReports', [])
+            history = []
+            for rep in reports[:4]:
+                year = rep.get('fiscalDateEnding', '')[:4]
+                revenue = safe_float(rep.get('totalRevenue'))
+                gross = safe_float(rep.get('grossProfit'))
+                ebit = safe_float(rep.get('ebit'))
+                net = safe_float(rep.get('netIncome'))
+                shares = safe_float(rep.get('commonStockSharesOutstanding'))
+                eps = round(net / shares, 4) if net and shares else None
+                history.append({
+                    'year': year,
+                    'revenue': revenue,
+                    'grossProfit': gross,
+                    'ebit': ebit,
+                    'netIncome': net,
+                    'dilutedEps': eps,
+                })
+            return history
+    except Exception:
+        pass
+    return []
+
+
+def av_earnings(sym):
+    if not AV_KEY:
+        return [], []
+    try:
+        url = (
+            f'https://www.alphavantage.co/query'
+            f'?function=EARNINGS&symbol={sym}&apikey={AV_KEY}'
+        )
+        r = requests.get(url, timeout=15)
+        if r.status_code == 200:
+            data = r.json()
+            quarterly = data.get('quarterlyEarnings', [])
+            history = []
+            for q in quarterly[:8]:
+                reported = safe_float(q.get('reportedEPS'))
+                estimated = safe_float(q.get('estimatedEPS'))
+                surprise = safe_float(q.get('surprisePercentage'))
+                history.append({
+                    'date': q.get('reportedDate', ''),
+                    'quarter': q.get('fiscalDateEnding', ''),
+                    'reportedEps': reported,
+                    'estimatedEps': estimated,
+                    'surprisePct': surprise,
+                })
+            annual = data.get('annualEarnings', [])
+            estimates = []
+            for a in annual[:4]:
+                estimates.append({
+                    'year': a.get('fiscalDateEnding', '')[:4],
+                    'eps': safe_float(a.get('reportedEPS')),
+                })
+            return history, estimates
+    except Exception:
+        pass
+    return [], []
+
+
+def av_balance_sheet(sym):
+    if not AV_KEY:
+        return {}
+    try:
+        url = (
+            f'https://www.alphavantage.co/query'
+            f'?function=BALANCE_SHEET&symbol={sym}&apikey={AV_KEY}'
+        )
+        r = requests.get(url, timeout=15)
+        if r.status_code == 200:
+            data = r.json()
+            reports = data.get('annualReports', [])
+            if reports:
+                rep = reports[0]
+                return {
+                    'totalDebt': safe_float(
+                        rep.get('shortLongTermDebtTotal') or rep.get('longTermDebt')
+                    ),
+                    'totalCash': safe_float(
+                        rep.get('cashAndCashEquivalentsAtCarryingValue')
+                    ),
+                    'currentAssets': safe_float(rep.get('totalCurrentAssets')),
+                    'currentLiabilities': safe_float(rep.get('totalCurrentLiabilities')),
+                }
+    except Exception:
+        pass
+    return {}
+
+
+def av_cash_flow(sym):
+    if not AV_KEY:
+        return {}
+    try:
+        url = (
+            f'https://www.alphavantage.co/query'
+            f'?function=CASH_FLOW&symbol={sym}&apikey={AV_KEY}'
+        )
+        r = requests.get(url, timeout=15)
+        if r.status_code == 200:
+            data = r.json()
+            reports = data.get('annualReports', [])
+            if reports:
+                rep = reports[0]
+                op_cf = safe_float(rep.get('operatingCashflow'))
+                capex = safe_float(rep.get('capitalExpenditures'))
+                if capex is not None:
+                    capex = abs(capex)
+                fcf = (
+                    (op_cf - capex)
+                    if (op_cf is not None and capex is not None)
+                    else op_cf
+                )
+                return {'freeCashflow': fcf}
+    except Exception:
+        pass
+    return {}
+
+
 @app.route('/api/stock/<ticker>')
 def get_stock(ticker):
     try:
         sym = ticker.upper()
 
-        # 1. Get price from Yahoo Finance v8 (always works)
         try:
             price_data = yf_chart(sym, '1d')
         except Exception as e:
@@ -126,7 +250,6 @@ def get_stock(ticker):
             meta.get('chartPreviousClose') or meta.get('previousClose')
         )
 
-        # 2. Get full chart history
         chart = []
         try:
             hist_data = yf_chart(sym, '1y')
@@ -134,19 +257,28 @@ def get_stock(ticker):
         except Exception:
             pass
 
-        # 3. Get valuation data from Alpha Vantage (needs API key)
         overview = av_overview(sym)
         aq = av_quote(sym)
+        income_history = av_income_statement(sym)
+        earnings_history, eps_estimates = av_earnings(sym)
+        balance = av_balance_sheet(sym)
+        cashflow = av_cash_flow(sym)
 
-        # Use AV price if available, else Yahoo v8 price
         if aq.get('05. price'):
             price = safe_float(aq.get('05. price')) or price
             prev_close = safe_float(aq.get('08. previous close')) or prev_close
 
-        chg = safe_float(aq.get('09. change'))
+        chg = safe_float(aq.get('09. change')) if aq else None
         if not chg and price and prev_close:
             chg = round(price - prev_close, 4)
-        chg_pct_raw = safe_float(aq.get('10. change percent', '').replace('%', ''))
+
+        chg_pct_raw = None
+        if aq:
+            raw_pct = aq.get('10. change percent', '')
+            if isinstance(raw_pct, str):
+                raw_pct = raw_pct.replace('%', '')
+            chg_pct_raw = safe_float(raw_pct)
+
         if chg_pct_raw is not None:
             chg_pct = round(chg_pct_raw / 100, 6)
         elif chg and prev_close:
@@ -154,20 +286,34 @@ def get_stock(ticker):
         else:
             chg_pct = None
 
-        # Extract valuation fields from Alpha Vantage overview
         def ov(key):
             v = overview.get(key, 'None')
             return safe_float(v) if v not in ('None', '', '-') else None
+
+        ca = balance.get('currentAssets')
+        cl = balance.get('currentLiabilities')
+        current_ratio = round(ca / cl, 4) if ca and cl else None
+
+        rev_estimates = [
+            {'year': r['year'], 'revenue': r['revenue']}
+            for r in income_history
+            if r.get('revenue')
+        ]
+
+        description = overview.get('Description', '') or ''
 
         result = {
             'symbol': sym,
             'companyName': overview.get('Name') or sym,
             'sector': overview.get('Sector', ''),
             'industry': overview.get('Industry', ''),
+            'longBusinessSummary': description,
+
             'price': price,
             'previousClose': prev_close,
             'change': chg,
             'changePercent': chg_pct,
+
             'marketCap': ov('MarketCapitalization'),
             'volume': meta.get('regularMarketVolume'),
             'avgVolume': ov('200DayMovingAverage'),
@@ -177,22 +323,40 @@ def get_stock(ticker):
             'fiftyTwoWeekLow': safe_float(
                 overview.get('52WeekLow') or meta.get('fiftyTwoWeekLow')
             ),
+
             'peRatio': ov('PERatio'),
             'forwardPE': ov('ForwardPE'),
             'pbRatio': ov('PriceToBookRatio'),
             'psRatio': ov('PriceToSalesRatioTTM'),
             'evEbitda': ov('EVToEBITDA'),
+            'pegRatio': ov('PEGRatio'),
+            'enterpriseToRevenue': ov('EVToRevenue'),
+
             'debtEquity': None,
-            'currentRatio': None,
+            'currentRatio': current_ratio,
+            'quickRatio': None,
+            'totalDebt': balance.get('totalDebt'),
+            'totalCash': balance.get('totalCash'),
+            'freeCashflow': cashflow.get('freeCashflow'),
+
             'roe': ov('ReturnOnEquityTTM'),
+            'returnOnAssets': ov('ReturnOnAssetsTTM'),
             'revenueGrowth': ov('QuarterlyRevenueGrowthYOY'),
             'earningsGrowth': ov('QuarterlyEarningsGrowthYOY'),
             'grossMargin': ov('GrossProfitTTM'),
             'operatingMargin': ov('OperatingMarginTTM'),
+            'profitMargins': ov('ProfitMargin'),
+
             'dividendYield': ov('DividendYield'),
             'beta': ov('Beta'),
             'eps': ov('EPS'),
             'targetPrice': ov('AnalystTargetPrice'),
+
+            'incomeHistory': income_history,
+            'epsEstimates': eps_estimates,
+            'revEstimates': rev_estimates,
+            'earningsHistory': earnings_history,
+
             'chart': chart,
             'analystRecommendations': [],
             '_source': 'alphavantage' if overview.get('Symbol') else 'yahoo_v8_only',
